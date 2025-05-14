@@ -11,77 +11,154 @@ import android.util.Log
 import android.widget.ArrayAdapter
 import android.widget.ListView
 import androidx.appcompat.app.AppCompatActivity
-import java.util.Locale
+import kotlin.math.log10
 import kotlin.math.pow
 
+/**
+ * Wi-Fi RSSI → 거리 추정 데모
+ *  • 모델 3종(FSPL / ITU Indoor / EWLM) 중 하나를 선택해 사용
+ *  • RSSI 노이즈는 단순 칼만 필터로 1차 저감
+ *  • 20 초마다 스캔 반복
+ *
+ * ※  위치 권한(ACCESS_FINE_LOCATION)과 Android 13+ 추가 권한(NEARBY-WIFI-DEVICES) 필요
+ */
 class MainActivity : AppCompatActivity() {
+
+    /* ---------- Android UI / Wi-Fi ---------- */
+
     private lateinit var wifiManager: WifiManager
     private lateinit var wifiListView: ListView
-    private lateinit var wifiListAdapter: ArrayAdapter<String>
+    private lateinit var wifiAdapter: ArrayAdapter<String>
 
-    companion object {
-        private const val RSSI_AT_1M         = -40         // 1미터 거리에서의 RSSI 값 (환경에 따라 조정)
-        private const val PATH_LOSS_EXPONENT = 3.0 // 실내 환경 감쇠 계수
-        private const val WALL_LOSS          = 1
-    }
+    /* ---------- RSSI 후처리 ---------- */
+
+    private val kalman = RssiKalman()                     // 노이즈 억제
+    private var model: PathLossModel = PathLossModel.Ewlm() // 기본 모델
+
+    /* ---------- 생명주기 ---------- */
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         wifiListView = findViewById(R.id.wifiListView)
-        wifiListAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf())
-        wifiListView.adapter = wifiListAdapter
+        wifiAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf())
+        wifiListView.adapter = wifiAdapter
 
         wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        if (!wifiManager.isWifiEnabled) wifiManager.isWifiEnabled = true
 
-        if (!wifiManager.isWifiEnabled) {
-            wifiManager.isWifiEnabled = true
+        /* 스캔 결과 브로드캐스트 수신 */
+        registerReceiver(wifiScanReceiver, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION))
+
+        startPeriodicScan()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceiver(wifiScanReceiver)
+    }
+
+    /* ---------- 브로드캐스트 리시버 ---------- */
+
+    private val wifiScanReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            val results = wifiManager.scanResults
+            render(results, minRssi = -70)
         }
+    }
 
-        // 브로드캐스트 리시버 등록 (스캔 결과 수신 시 filterBySignalStrength 호출)
-        registerReceiver(object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                Log.d("WiFiScan", "Received scan results broadcast")
-                val scanResults = wifiManager.scanResults
-                filterBySignalStrength(scanResults, -60) // -70dBm 이상의 신호만 필터링
-            }
-        }, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION))
+    /* ---------- 주기적 스캔 ---------- */
 
+    private fun startPeriodicScan() {
         wifiManager.startScan()
-        Log.d("WiFiScan", "Started Wi-Fi scan")
+        /* 20 초마다 재스캔 */
+        wifiListView.postDelayed({ startPeriodicScan() }, 20_000)
     }
 
-    // RSSI 값에 따라 거리를 계산하는 함수 (단위: 미터)
-    private fun calculateDistance(rssi: Int, walls: Int): Double {
-        val totalLoss = (RSSI_AT_1M - rssi) - (walls * WALL_LOSS)
-        return 10.0.pow(totalLoss / (10 * PATH_LOSS_EXPONENT))
-    }
+    /* ---------- 스캔 결과 처리 & UI ---------- */
 
-    private fun filterBySignalStrength(scanResults: List<ScanResult>, minRssi: Int) {
-        Log.d("WiFiScan", "Scan result size: ${scanResults.size}") // 🔥 로그 추가
-        val filteredResults = scanResults.filter { it.level >= minRssi }
-
-        if (filteredResults.isEmpty()) {
-            Log.d("WiFiScan", "No Wi-Fi networks found.") // 🔥 로그 추가
-        }
-
-        val wifiInfoList = if (filteredResults.isEmpty()) {
+    private fun render(results: List<ScanResult>, minRssi: Int) {
+        val rows = if (results.isEmpty()) {
             listOf("Wi-Fi 네트워크를 찾을 수 없습니다.")
         } else {
-            filteredResults.map {
-                val distance = calculateDistance(it.level, 1)
-                // 소수점 둘째 자리까지 포맷팅
-                val distanceFormatted = String.format(Locale.US, "%.2f", distance)
-                "${it.SSID} - ${it.level}dBm, 거리: ${distanceFormatted}m"
-            }
+            results.filter { it.level >= minRssi }
+                .sortedBy { it.level }
+                .map { sr ->
+                    val clean = kalman.filter(sr.level)          // RSSI 필터링
+                    val d     = model.distance(clean, sr.frequency, walls = 1)
+                    val df    = String.format("%.2f", d)
+                    "${sr.SSID.ifBlank { "(hidden)" }}  •  ${clean} dBm  •  ${df} m"
+                }.ifEmpty { listOf("신호 세기 −70 dBm 이상 AP 없음") }
         }
 
-        runOnUiThread {
-            Log.d("WiFiScan", "Updating ListView with ${wifiInfoList.size} items") // 🔥 로그 추가
-            wifiListAdapter.clear()
-            wifiListAdapter.addAll(wifiInfoList)
-            wifiListAdapter.notifyDataSetChanged()
+        wifiAdapter.clear()
+        wifiAdapter.addAll(rows)
+        wifiAdapter.notifyDataSetChanged()
+    }
+}
+
+/* ========================================================================== */
+/*                                RSSI 모델                                  */
+/* ========================================================================== */
+
+sealed class PathLossModel {
+
+    abstract fun distance(rssi: Int, freqMHz: Int, walls: Int = 0): Double
+
+    /** 자유공간손실(FSPL) – LOS 환경 */
+    data class Fspl(val txPowerAt1m: Int = -43) : PathLossModel() {
+        override fun distance(rssi: Int, freqMHz: Int, walls: Int): Double {
+            val exponent = (txPowerAt1m - rssi - 20.0 * log10(freqMHz.toDouble()) + 27.55) / 20.0
+            return 10.0.pow(exponent)
         }
+    }
+
+    /** ITU Indoor – 사무실/상가 표준 */
+    data class ItuIndoor(
+        val n: Double = 28.0,       // 감쇠 지수
+        val floorLoss: Int = 0      // 층간 손실(필요 시)
+    ) : PathLossModel() {
+        override fun distance(rssi: Int, freqMHz: Int, walls: Int): Double {
+            val pl = -rssi // 송신 전력을 모를 때 PL ≈ −RSSI
+            val exponent = (pl + 28 - 20 * log10(freqMHz.toDouble()) - floorLoss) / n
+            return 10.0.pow(exponent)
+        }
+    }
+
+    /** Log-Distance + 벽 보정(EWLM) – 복잡한 실내 */
+    data class Ewlm(
+        val rssiAt1m: Int = -40,
+        val gamma: Double = 3.0,
+        val wallLoss: Int = 3       // dB/벽
+    ) : PathLossModel() {
+        override fun distance(rssi: Int, freqMHz: Int, walls: Int): Double {
+            val loss = (rssiAt1m - rssi) - walls * wallLoss
+            return 10.0.pow(loss / (10 * gamma))
+        }
+    }
+}
+
+/* ========================================================================== */
+/*                              RSSI 칼만 필터                                */
+/* ========================================================================== */
+
+class RssiKalman(
+    private val q: Double = 0.001,  // 프로세스 노이즈
+    private val r: Double = 2.0     // 측정 노이즈
+) {
+    private var p = 1.0
+    private var x = 0.0
+    private var init = false
+
+    fun filter(measurement: Int): Int {
+        if (!init) { x = measurement.toDouble(); init = true }
+        // 예측
+        p += q
+        // 보정
+        val k = p / (p + r)
+        x += k * (measurement - x)
+        p *= (1 - k)
+        return x.toInt()
     }
 }
